@@ -5,7 +5,7 @@
 ### Create environment
 
 1. Install [Conda](https://docs.conda.io/projects/conda/en/latest/user-guide/install/)
-2. Create environment from zipline.yaml by executing in root of project
+2. Create environment from strategies.yml by executing in root of project
 ```shell script
 conda env create -f strategies.yml 
 ```
