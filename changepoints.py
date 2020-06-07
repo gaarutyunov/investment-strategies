@@ -15,11 +15,22 @@ if __name__ == "__main__":
 
     engine = create_engine(conn_str)
 
-    for _, symbol in available_stocks().iteritems():
+    for _, symbol in [(0, 'NSVZ'),
+                      (1, 'TRNFP'),
+                      (2, 'UNAC'),
+                      (3, 'FIVE'),
+                      (4, 'PRFN'),
+                      (5, 'KRKNP'),
+                      (6, 'KZOS'),
+                      (7, 'KZOSP'),
+                      (8, 'RKKE'),
+                      (9, 'MSST'),
+                      (10, 'SBER'),
+                      (11, 'BANE')]:
         query = """select 
                             trade_date as date, close, ticker
-                            from equity_history where ticker='{}' and trade_date >= '2012-01-03'
-                            and trade_date <= '2018-12-31'
+                            from equity_history where ticker='{}' and trade_date >= '2010-01-03'
+                            and trade_date <= '2019-12-31'
                             order by trade_date;
                     """.format(symbol)
 

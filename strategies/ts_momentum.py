@@ -2,12 +2,8 @@ from datetime import timedelta, datetime
 
 import numpy as np
 import pandas as pd
-import pytz
 from pandas import DataFrame
-from trading_calendars import get_calendar
-from zipline import run_algorithm
-from zipline.api import symbol, order_target_percent, schedule_function
-from zipline.utils.events import date_rules, time_rules
+from zipline.api import symbol, order_target_percent
 
 from strategies.momentum import Momentum
 from utils.get_available_assets import get_available_assets
@@ -25,24 +21,40 @@ class TSMomentum(Momentum):
                  filter_stocks=None,
                  vol_scale=0.4,
                  vola_window=20,
-                 filter_file=None) -> None:
+                 filter_file=None,
+                 commission=None,
+                 buy_sell_strategy=0) -> None:
         super().__init__(momentum_gap=momentum_gap, ranking_period=ranking_period, holding_period=holding_period,
-                         filter_stocks=filter_stocks)
+                         filter_stocks=filter_stocks, commission=commission)
         self.vol_scale = vol_scale
         self.vola_window = vola_window
         self.all_assets = get_available_assets()
+        self.buy_sell_strategy = buy_sell_strategy
         if filter_file is not None:
             self.filter_members = pd.read_csv(filter_file, parse_dates=['date'], index_col='date')
+
+    def __str__(self):
+        return """
+                - Ranking Period: {} months
+                - Holding Period: {} months
+                - Volatility window: {}
+                - Rebalance technique: Volatility-weighted Scale({:.2%})
+                """.format(self.ranking_period,
+                           self.holding_period,
+                           self.vola_window,
+                           self.vol_scale)
 
     def rebalance(self, context, data):
         # Momentum.output_progress(context)
         # get historic data
-        if self.counter == self.holding_period:
-            self.counter = 0
 
         if self.counter == 0:
             first_date, last_date, history = self.history(context, data)
             returns = history.apply(cumulative_returns, first_date=first_date, last_date=last_date)
+            if self.buy_sell_strategy < 0:
+                returns = returns.where(returns < 0)
+            elif self.buy_sell_strategy > 0:
+                returns = returns.where(returns > 0)
             returns = returns.dropna()
             # calculate inverse volatility to scale
             vol = history.apply(volatility, vola_window=self.vola_window)
@@ -50,16 +62,22 @@ class TSMomentum(Momentum):
             inverse_vol = self.vol_scale / vol
             vol_sum = inverse_vol.sum()
             weights = (inverse_vol / vol_sum).fillna(0)
-
-            for security in context.portfolio.positions:
-                if data.can_trade(security):
-                    order_target_percent(security, 0)
+            weights = weights.reindex(index=returns.index).fillna(0)
 
             for security, weight in weights.items():
                 weight *= np.sign(returns[security])
                 order_target_percent(security, weight)
 
         self.counter += 1
+
+    def sell_stocks(self, context, data):
+        if self.counter == self.holding_period:
+            self.counter = 0
+
+        if self.counter == 0:
+            for security in context.portfolio.positions:
+                if data.can_trade(security):
+                    order_target_percent(security, 0)
 
     def history(self, context, data) -> (datetime, datetime, DataFrame):
         today = context.get_datetime()
@@ -94,18 +112,10 @@ class TSMomentum(Momentum):
             available_stocks = available_stocks.intersection(list_of_tickers)
         # get symbol info
         symbols = [symbol(s) for s in available_stocks]
+        history_sessions = sessions_in_range(today - timedelta(days=400), today)
         # get historic data
-        return first_date, last_date, data.history(symbols, "close", len(sessions_in_range(first_date, today)), "1d") \
-            .reindex(index=sessions) \
+        return first_date, last_date, data.history(symbols,
+                                                   "close",
+                                                   len(history_sessions),
+                                                   "1d") \
             .dropna(axis=1)
-
-    def _sell_old_stocks(self, context, data):
-        i = 0
-        for port in context.portfolios:
-            if port['holding_period'] == self.holding_period:
-                for security, _ in context.portfolios.pop(i)['stocks'].items():
-                    if data.can_trade(security):
-                        order_target_percent(security, 0)
-            else:
-                port['holding_period'] += 1
-            i += 1

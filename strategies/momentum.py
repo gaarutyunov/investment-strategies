@@ -1,7 +1,9 @@
 from datetime import timedelta
 
 from pyfolio.utils import extract_rets_pos_txn_from_zipline
-from zipline.api import symbol, order_target_percent
+from zipline.api import symbol, order_target_percent, schedule_function, set_commission, set_slippage
+from zipline.finance.slippage import FixedSlippage
+from zipline.utils.events import date_rules, time_rules
 
 from utils.get_available_assets import get_available_assets
 from utils.trading_utils import sessions_in_range, cumulative_returns
@@ -16,16 +18,39 @@ class Momentum:
                  holding_period=3,
                  losers_amount=10,
                  winners_amount=10,
-                 filter_stocks=None) -> None:
+                 filter_stocks=None,
+                 commission=None) -> None:
         if filter_stocks is None:
-            filter_stocks = ['FIVE', 'KZOSP', 'NSVZ', 'RKKE', 'TRNFP', 'TCSG', 'ENPG', 'KLSB', 'UNAC', 'TGKN',
-                             'KRKNP', 'KROT', 'MSST', 'PRFN', 'DASB', 'TGKA']
+            filter_stocks = ['FIVE', 'KZOSP', 'NSVZ', 'RKKE', 'TRNFP',
+                             'TCSG', 'ENPG', 'KLSB', 'UNAC', 'TGKN',
+                             'KRKNP', 'KROT', 'MSST', 'PRFN', 'DASB',
+                             'TGKA', 'BANE']
         self.momentum_gap = momentum_gap
         self.ranking_period = ranking_period
         self.holding_period = holding_period
         self.losers_amount = losers_amount
         self.winners_amount = winners_amount
         self.filter_stocks = filter_stocks
+        self.commission = commission
+
+    def __str__(self):
+        return """
+                Cross-Sectional Momentum
+                - Ranking Period: {} months
+                - Holding Period: {} months
+                - Assets in losers portfolio: {}
+                - Assets in winners portfolio: {}
+                - Rebalance technique: Equally-weighted
+                """.format(self.ranking_period, self.holding_period, self.losers_amount, self.winners_amount)
+
+    def initialize(self, context):
+        context.portfolios = list()
+        schedule_function(self.rebalance, date_rule=date_rules.month_start(), time_rule=time_rules.market_open())
+        schedule_function(self.sell_stocks, date_rule=date_rules.month_end(1), time_rule=time_rules.market_close())
+        if self.commission:
+            set_commission(self.commission)
+
+        set_slippage(FixedSlippage(spread=0.0))
 
     @staticmethod
     def output_progress(context):
@@ -42,31 +67,22 @@ class Momentum:
         # Remember today's portfolio value for next month's calculation
         context.last_month = context.portfolio.portfolio_value
 
-    @staticmethod
-    def rebalance(context, data):
+    def rebalance(self, context, data):
         # Momentum.output_progress(context)
-
-        ranking_period = context.strategy.ranking_period
-        holding_period = context.strategy.holding_period
-        momentum_gap = context.strategy.momentum_gap
-        losers_amount = context.strategy.losers_amount
-        winners_amount = context.strategy.winners_amount
-        filter_stocks = context.strategy.filter_stocks
-        portfolio_size = winners_amount + losers_amount
 
         # get trading date
         today = context.get_datetime()
 
-        sessions = sessions_in_range(today - timedelta(days=(ranking_period + momentum_gap) * 30),
-                                     today - timedelta(days=momentum_gap * 30))
+        sessions = sessions_in_range(today - timedelta(days=(self.ranking_period + self.momentum_gap) * 30),
+                                     today - timedelta(days=self.momentum_gap * 30))
 
         first_date = sessions[0]
         last_date = sessions[-1]
 
         # get available stocks
         available_stocks = set(get_available_assets(first_date=first_date, last_date=last_date))
-        if filter_stocks is not None:
-            available_stocks = available_stocks.difference(filter_stocks)
+        if self.filter_stocks is not None:
+            available_stocks = available_stocks.difference(self.filter_stocks)
         # get symbol info
         symbols = [symbol(s) for s in available_stocks]
         # get historic data
@@ -79,25 +95,15 @@ class Momentum:
             .dropna() \
             .sort_values()
         # get losers and winners
-        if losers_amount > 0:
-            losers = returns.loc[returns < 0][:losers_amount]
+        if self.losers_amount > 0:
+            losers = returns.loc[returns < 0][:self.losers_amount]
         else:
             losers = pd.Series()
 
-        if winners_amount > 0:
-            winners = returns.loc[returns > 0.01][-winners_amount:]
+        if self.winners_amount > 0:
+            winners = returns.loc[returns > 0.01][-self.winners_amount:]
         else:
             winners = pd.Series()
-
-        i = 0
-        for port in context.portfolios:
-            if port['holding_period'] == holding_period:
-                for security in context.portfolios.pop(i)['stocks'].items():
-                    if data.can_trade(security[0]):
-                        order_target_percent(security[0], 0)
-            else:
-                port['holding_period'] += 1
-            i += 1
 
         new_portfolio = {
             'stocks': losers.append(winners),
@@ -106,17 +112,28 @@ class Momentum:
 
         context.portfolios.append(new_portfolio)
 
-        if losers_amount > 0:
+        if self.losers_amount > 0:
             for loser in losers.items():
                 if data.can_trade(loser[0]):
-                    order_target_percent(loser[0], -(1 / (len(new_portfolio['stocks']) * holding_period)))
+                    order_target_percent(loser[0], -(1 / (len(new_portfolio['stocks']) * self.holding_period)))
 
-        if winners_amount > 0:
+        if self.winners_amount > 0:
             for winner in winners.items():
                 if data.can_trade(winner[0]):
-                    order_target_percent(winner[0], 1 / (len(new_portfolio['stocks']) * holding_period))
+                    order_target_percent(winner[0], 1 / (len(new_portfolio['stocks']) * self.holding_period))
 
-    @staticmethod
-    def analyze(context, perf):
+    def sell_stocks(self, context, data):
+        i = 0
+        for port in context.portfolios:
+            if port['holding_period'] == self.holding_period:
+                for security in context.portfolios.pop(i)['stocks'].items():
+                    if data.can_trade(security[0]):
+                        order_target_percent(security[0], 0)
+            else:
+                port['holding_period'] += 1
+            i += 1
+
+    def analyze(self, context, perf):
+        print(self.__str__())
         returns, positions, transactions = extract_rets_pos_txn_from_zipline(perf)
         pf.create_full_tear_sheet(returns=returns, positions=positions, transactions=transactions)
