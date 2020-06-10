@@ -1,7 +1,13 @@
-from datetime import timedelta
+import time
+from datetime import timedelta, datetime
+from pathlib import Path
 
+import empyrical
+import pytz
 from pyfolio.utils import extract_rets_pos_txn_from_zipline
-from zipline.api import symbol, order_target_percent, schedule_function, set_commission, set_slippage
+from trading_calendars import get_calendar
+from zipline import run_algorithm
+from zipline.api import symbol, order_target_percent, schedule_function, set_commission, set_slippage, set_benchmark
 from zipline.finance.slippage import FixedSlippage
 from zipline.utils.events import date_rules, time_rules
 
@@ -32,6 +38,7 @@ class Momentum:
         self.winners_amount = winners_amount
         self.filter_stocks = filter_stocks
         self.commission = commission
+        self.start = None
 
     def __str__(self):
         return """
@@ -44,13 +51,17 @@ class Momentum:
                 """.format(self.ranking_period, self.holding_period, self.losers_amount, self.winners_amount)
 
     def initialize(self, context):
+        set_benchmark(symbol('MICEX'))
         context.portfolios = list()
-        schedule_function(self.rebalance, date_rule=date_rules.month_start(), time_rule=time_rules.market_open())
+        schedule_function(self.rebalance, date_rule=date_rules.month_start(), time_rule=time_rules.market_close())
         schedule_function(self.sell_stocks, date_rule=date_rules.month_end(1), time_rule=time_rules.market_close())
         if self.commission:
             set_commission(self.commission)
 
         set_slippage(FixedSlippage(spread=0.0))
+
+        self.start = time.time()
+        print('Initialized strategy {} at {:1.1f} seconds'.format(self.file_name(), time.time() - self.start))
 
     @staticmethod
     def output_progress(context):
@@ -73,8 +84,8 @@ class Momentum:
         # get trading date
         today = context.get_datetime()
 
-        sessions = sessions_in_range(today - timedelta(days=(self.ranking_period + self.momentum_gap) * 30),
-                                     today - timedelta(days=self.momentum_gap * 30))
+        sessions = sessions_in_range(today - timedelta(days=(self.ranking_period + self.momentum_gap) * 20),
+                                     today - timedelta(days=self.momentum_gap * 20))
 
         first_date = sessions[0]
         last_date = sessions[-1]
@@ -90,8 +101,9 @@ class Momentum:
             .reindex(index=sessions) \
             .dropna(axis=1)
         # get returns
-        returns = history.apply(cumulative_returns, first_date=first_date, last_date=last_date)
-        returns = returns \
+        returns = history.reindex(sessions).dropna().apply(empyrical.simple_returns)
+        cum_rets = empyrical.cum_returns(returns)
+        returns = cum_rets.iloc[-1, :] \
             .dropna() \
             .sort_values()
         # get losers and winners
@@ -115,12 +127,12 @@ class Momentum:
         if self.losers_amount > 0:
             for loser in losers.items():
                 if data.can_trade(loser[0]):
-                    order_target_percent(loser[0], -(1 / (len(new_portfolio['stocks']) * self.holding_period)))
+                    order_target_percent(loser[0], -1 / self.losers_amount / self.holding_period)
 
         if self.winners_amount > 0:
             for winner in winners.items():
                 if data.can_trade(winner[0]):
-                    order_target_percent(winner[0], 1 / (len(new_portfolio['stocks']) * self.holding_period))
+                    order_target_percent(winner[0], 1 / self.winners_amount / self.holding_period)
 
     def sell_stocks(self, context, data):
         i = 0
@@ -134,6 +146,56 @@ class Momentum:
             i += 1
 
     def analyze(self, context, perf):
-        print(self.__str__())
-        returns, positions, transactions = extract_rets_pos_txn_from_zipline(perf)
-        pf.create_full_tear_sheet(returns=returns, positions=positions, transactions=transactions)
+        # returns, positions, transactions = extract_rets_pos_txn_from_zipline(perf)
+        # pf.create_full_tear_sheet(returns=returns,
+        #                           positions=positions,
+        #                           transactions=transactions)
+        self.to_pickle(perf)
+        print('Finnished strategy {} at {:1.1f} seconds'.format(self.file_name(), time.time() - self.start))
+
+    def to_pickle(self, perf):
+        outname = self.file_name()
+        outdir = Path('data/out/CSMOM')
+        outdir.mkdir(parents=True, exist_ok=True)
+        perf.to_pickle(outdir / outname)
+
+    def file_name(self) -> str:
+        if self.winners_amount > self.losers_amount:
+            b_s_type = 'L'
+        elif self.losers_amount > self.winners_amount:
+            b_s_type = 'S'
+        else:
+            b_s_type = 'L_S'
+        return 'CSMOM_{}_{}_{}.pickle'.format(b_s_type, self.ranking_period, self.holding_period)
+
+
+if __name__ == "__main__":
+    def initialize(context):
+        strategy = Momentum(ranking_period=3,
+                            holding_period=3,
+                            momentum_gap=1,
+                            losers_amount=15,
+                            winners_amount=15)
+        strategy.initialize(context)
+        context.strategy = strategy
+
+
+    def rebalance(context, data):
+        context.strategy.rebalance(context, data)
+
+
+    def analyze(context, perf: pd.DataFrame) -> None:
+        context.strategy.analyze(context, perf)
+
+
+    start = datetime(2012, 1, 3, 7, 0, 0, tzinfo=pytz.timezone('Europe/Moscow'))
+    end = datetime(2018, 12, 31, 7, 0, 0, tzinfo=pytz.timezone('Europe/Moscow'))
+    results = run_algorithm(
+        start=start,
+        end=end,
+        initialize=initialize,
+        capital_base=100000000,
+        analyze=analyze,
+        bundle='database_bundle2',
+        trading_calendar=get_calendar('XMOS')
+    )

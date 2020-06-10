@@ -91,9 +91,15 @@ def process_stocks(symbols, sessions, metadata, divs):
         sid += 1
 
         # Make a database query
-        query = """select 
-                    trade_date as date, open, high, low, close, volume, dividend 
-                    from equity_history where ticker='{}' order by trade_date;
+        query = """select e.trade_date as date,
+                   e.ticker as ticker,
+                   e.close * i.lot as close,
+                   e.open * i.lot  as open,
+                   e.high * i.lot  as high,
+                   e.low * i.lot as low,
+                   e.volume as volume
+                    from equity_history e
+                join instruments i on e.ticker = i.ticker;
             """.format(symbol)
 
         # Ask the database for the data

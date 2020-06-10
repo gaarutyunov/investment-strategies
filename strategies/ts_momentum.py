@@ -1,8 +1,13 @@
 from datetime import timedelta, datetime
+from pathlib import Path
 
+import empyrical
 import numpy as np
 import pandas as pd
+import pytz
 from pandas import DataFrame
+from trading_calendars import get_calendar
+from zipline import run_algorithm
 from zipline.api import symbol, order_target_percent
 
 from strategies.momentum import Momentum
@@ -20,7 +25,7 @@ class TSMomentum(Momentum):
                  holding_period=3,
                  filter_stocks=None,
                  vol_scale=0.4,
-                 vola_window=20,
+                 vola_window=242,
                  filter_file=None,
                  commission=None,
                  buy_sell_strategy=0) -> None:
@@ -35,6 +40,7 @@ class TSMomentum(Momentum):
 
     def __str__(self):
         return """
+                Time-Series Momentum
                 - Ranking Period: {} months
                 - Holding Period: {} months
                 - Volatility window: {}
@@ -48,16 +54,24 @@ class TSMomentum(Momentum):
         # Momentum.output_progress(context)
         # get historic data
 
+        def vol(ts):
+            logreturns = np.log(ts / ts.shift(1))
+            return np.sqrt(self.vola_window * logreturns.var())
+
         if self.counter == 0:
-            first_date, last_date, history = self.history(context, data)
-            returns = history.apply(cumulative_returns, first_date=first_date, last_date=last_date)
+            first_date, last_date, sessions, history = self.history(context, data)
+            returns = history.reindex(sessions).dropna().apply(empyrical.simple_returns)
+            cum_rets = empyrical.cum_returns(returns)
+            returns = cum_rets.iloc[-1, :] \
+                .dropna() \
+                .sort_values()
             if self.buy_sell_strategy < 0:
                 returns = returns.where(returns < 0)
             elif self.buy_sell_strategy > 0:
                 returns = returns.where(returns > 0)
             returns = returns.dropna()
             # calculate inverse volatility to scale
-            vol = history.apply(volatility, vola_window=self.vola_window)
+            vol = history.apply(vol, axis=0)
             vol = vol.where(vol != 0).dropna()
             inverse_vol = self.vol_scale / vol
             vol_sum = inverse_vol.sum()
@@ -114,8 +128,55 @@ class TSMomentum(Momentum):
         symbols = [symbol(s) for s in available_stocks]
         history_sessions = sessions_in_range(today - timedelta(days=400), today)
         # get historic data
-        return first_date, last_date, data.history(symbols,
-                                                   "close",
-                                                   len(history_sessions),
-                                                   "1d") \
+        return first_date, last_date, sessions, data.history(symbols,
+                                                             "close",
+                                                             len(history_sessions),
+                                                             "1d") \
             .dropna(axis=1)
+
+    def file_name(self) -> str:
+        if self.buy_sell_strategy > 0:
+            b_s_type = 'L'
+        elif self.buy_sell_strategy < 0:
+            b_s_type = 'S'
+        else:
+            b_s_type = 'L_S'
+        return 'TSMOM_{}_{}_{}.pickle'.format(b_s_type, self.ranking_period, self.holding_period)
+
+    def to_pickle(self, perf):
+        outname = self.file_name()
+        outdir = Path('data/out/TSMOM')
+        outdir.mkdir(parents=True, exist_ok=True)
+        perf.to_pickle(outdir / outname)
+
+
+if __name__ == "__main__":
+    def initialize(context):
+        strategy = TSMomentum(ranking_period=9,
+                              holding_period=9,
+                              momentum_gap=1,
+                              vol_scale=0.4,
+                              vola_window=242)
+        strategy.initialize(context)
+        context.strategy = strategy
+
+
+    def rebalance(context, data):
+        context.strategy.rebalance(context, data)
+
+
+    def analyze(context, perf: pd.DataFrame) -> None:
+        context.strategy.analyze(context, perf)
+
+
+    start = datetime(2012, 1, 3, 7, 0, 0, tzinfo=pytz.timezone('Europe/Moscow'))
+    end = datetime(2018, 12, 29, 7, 0, 0, tzinfo=pytz.timezone('Europe/Moscow'))
+    results = run_algorithm(
+        start=start,
+        end=end,
+        initialize=initialize,
+        capital_base=1000000,
+        analyze=analyze,
+        bundle='database_bundle2',
+        trading_calendar=get_calendar('XMOS')
+    )
